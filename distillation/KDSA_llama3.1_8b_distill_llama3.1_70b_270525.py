@@ -11,7 +11,7 @@ from tqdm import tqdm
 # Parameters
 teacher_model_id = "meta-llama/Llama-3.1-70B"  # Change this to a bigger model like roberta-large if needed
 student_model_id = "meta-llama/Llama-3.1-8B"   # Small student model
-save_path = "./saved_models/llama3.1_8b_distill_llama3.1_70b_logits"
+save_path = "./saved_models/llama3.1_8b_distill_llama3.1_70b"
 csv_path = "movie.csv"
 num_labels = 2
 batch_size = 16
