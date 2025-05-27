@@ -1,94 +1,114 @@
 import pandas as pd
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from torch import nn
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW
 from datasets import Dataset
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import classification_report
 import os
+from tqdm import tqdm
 
 # Parameters
-teacher_model_id = "meta-llama/Meta-Llama-3-70B-Instruct"
-student_model_id = "google/gemma-2b"  # or another small LLM like "bert-base-uncased"
-save_path = "./saved_models/llama_distilled"
+teacher_model_id = "bert-large-uncased"  # Change this to a bigger model like roberta-large if needed
+student_model_id = "bert-base-uncased"   # Small student model
+save_path = "./saved_models/llama_distilled_logits"
 csv_path = "movie.csv"
+num_labels = 2
+batch_size = 16
+num_epochs = 3
+learning_rate = 2e-5
+temperature = 2.0
+alpha = 0.7  # weight for distillation loss vs. hard label loss
 
-# Step 1: Load dataset
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load dataset
 df = pd.read_csv(csv_path)
 df = df[["text", "label"]].dropna()
-
-# Step 2: Create Hugging Face Dataset
 dataset = Dataset.from_pandas(df)
 
-# Step 3: Load teacher model (causal LM)
-teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_id)
-teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model_id, device_map="auto", torch_dtype=torch.float16)
+# Load tokenizers and models
+tokenizer = AutoTokenizer.from_pretrained(student_model_id)
 
-# Soft-label inference function
-def get_teacher_soft_label(example):
-    prompt = f"Classify the sentiment of the following sentence as either Positive or Negative.\n\nSentence: \"{example['text']}\"\nSentiment:"
-    inputs = teacher_tokenizer(prompt, return_tensors="pt").to("cuda")
-    outputs = teacher_model.generate(**inputs, max_new_tokens=10)
-    decoded = teacher_tokenizer.decode(outputs[0], skip_special_tokens=True).lower()
-    example["teacher_label"] = 1 if "positive" in decoded else 0
-    return example
+teacher_model = AutoModelForSequenceClassification.from_pretrained(teacher_model_id, num_labels=num_labels).to(device)
+teacher_model.eval()
 
-print("Generating soft labels using teacher model...")
-dataset = dataset.map(get_teacher_soft_label)
+student_model = AutoModelForSequenceClassification.from_pretrained(student_model_id, num_labels=num_labels).to(device)
 
-# Step 4: Load student model (sequence classification)
-student_tokenizer = AutoTokenizer.from_pretrained(student_model_id)
-student_model = AutoModelForSequenceClassification.from_pretrained(student_model_id, num_labels=2)
+# Tokenization
+def tokenize(example):
+    return tokenizer(example["text"], truncation=True, padding="max_length", max_length=128)
 
-# Tokenize for student
-def tokenize_function(example):
-    return student_tokenizer(example["text"], truncation=True, padding="max_length", max_length=128)
+tokenized_dataset = dataset.map(tokenize, batched=True)
+tokenized_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
-tokenized_dataset = dataset.map(tokenize_function, batched=True)
+# DataLoader
+train_loader = DataLoader(tokenized_dataset, batch_size=batch_size, shuffle=True)
 
-# Rename teacher_label to labels
-tokenized_dataset = tokenized_dataset.rename_column("teacher_label", "labels")
-tokenized_dataset.set_format("torch")
+# Loss functions
+kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
+ce_loss_fn = nn.CrossEntropyLoss()
 
-# Step 5: Train student model
-training_args = TrainingArguments(
-    output_dir="./results",
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    learning_rate=2e-5,
-    per_device_train_batch_size=8,
-    num_train_epochs=3,
-    weight_decay=0.01,
-    save_total_limit=1,
-    load_best_model_at_end=True,
-    logging_dir='./logs',
-)
+# Optimizer
+optimizer = AdamW(student_model.parameters(), lr=learning_rate)
 
-trainer = Trainer(
-    model=student_model,
-    args=training_args,
-    train_dataset=tokenized_dataset,
-    eval_dataset=tokenized_dataset,  # optional, same for demo
-    tokenizer=student_tokenizer,
-)
+# Distillation training loop
+print("🔁 Starting distillation training...")
 
-print("Training student model...")
-trainer.train()
+for epoch in range(num_epochs):
+    student_model.train()
+    total_loss = 0.0
 
-# Step 6: Save student model
+    for batch in tqdm(train_loader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["label"].to(device)
+
+        # Teacher outputs
+        with torch.no_grad():
+            teacher_logits = teacher_model(input_ids=input_ids, attention_mask=attention_mask).logits
+            soft_labels = torch.softmax(teacher_logits / temperature, dim=1)
+
+        # Student outputs
+        student_outputs = student_model(input_ids=input_ids, attention_mask=attention_mask)
+        student_logits = student_outputs.logits
+        soft_student = torch.log_softmax(student_logits / temperature, dim=1)
+
+        # Compute losses
+        loss_kl = kl_loss_fn(soft_student, soft_labels) * (temperature ** 2)
+        loss_ce = ce_loss_fn(student_logits, labels)
+        loss = alpha * loss_kl + (1 - alpha) * loss_ce
+
+        # Backpropagation
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print(f"✅ Epoch {epoch+1} completed. Loss: {total_loss:.4f}")
+
+# Save the distilled model
 os.makedirs(save_path, exist_ok=True)
 student_model.save_pretrained(save_path)
-student_tokenizer.save_pretrained(save_path)
-print(f"\n✅ Distilled student model saved to: {save_path}")
+tokenizer.save_pretrained(save_path)
+print(f"\n💾 Distilled student model saved to: {save_path}")
 
-# Step 7: Evaluate distilled model
-def predict_sentiment(texts):
-    inputs = student_tokenizer(texts, return_tensors="pt", truncation=True, padding=True, max_length=128).to("cuda" if torch.cuda.is_available() else "cpu")
-    outputs = student_model(**inputs)
-    probs = torch.softmax(outputs.logits, dim=1)
-    preds = torch.argmax(probs, dim=1)
-    return preds.cpu().numpy()
+# Evaluation
+print("\n📊 Evaluating the distilled student model...")
+student_model.eval()
 
-print("\nEvaluating distilled model on actual labels...")
-preds = predict_sentiment(df["text"].tolist())
+def predict(texts):
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+    with torch.no_grad():
+        outputs = student_model(**inputs).logits
+    return torch.argmax(outputs, dim=1).cpu().numpy()
+
+preds = []
+labels = df["label"].tolist()
+for i in range(0, len(df), batch_size):
+    batch_texts = df["text"].iloc[i:i+batch_size].tolist()
+    preds.extend(predict(batch_texts))
 
 print("\nClassification Report:")
-print(classification_report(df["label"], preds, target_names=["Negative", "Positive"]))
+print(classification_report(labels, preds, target_names=["Negative", "Positive"]))
