@@ -16,7 +16,7 @@ os.makedirs(os.path.dirname(output_data_path), exist_ok=True)
 os.makedirs(os.path.dirname(results_csv_path), exist_ok=True)
 
 print(" Loading dataset...")
-original_df = pd.read_csv(input_csv)
+original_df = pd.read_csv(input_csv).head(100)
 
 # Step 1: Load tokenizer and model
 print(" Loading LLaMA 3.1 8B model and tokenizer...")
